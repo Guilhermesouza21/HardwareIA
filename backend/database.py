@@ -21,8 +21,8 @@ def init_db():
         return False
         
     try:
-        # Create a connection pool (min 1, max 10 connections)
-        db_pool = pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
+        # Create a connection pool (min 1, max 10 connections) that is thread-safe
+        db_pool = pool.ThreadedConnectionPool(1, 10, dsn=DATABASE_URL)
         logger.info("Database connection pool initialized successfully.")
         
         # Verify connection and create tables if not exists
