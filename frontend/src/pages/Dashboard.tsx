@@ -420,7 +420,7 @@ export default function Dashboard() {
               </div>
               <div style={{ display: 'flex', alignItems: 'center' }}>
                 <span className="badge" style={{ background: 'var(--primary-glow)', color: 'var(--primary)', border: '1px solid rgba(6, 182, 212, 0.2)' }}>
-                  Online (GPT-4o)
+                  Online (Llama 3.3)
                 </span>
               </div>
             </div>

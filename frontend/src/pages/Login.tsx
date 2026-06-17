@@ -114,7 +114,7 @@ export default function Login() {
           </h2>
           <p className="auth-subtitle">
             {isSignUp 
-              ? 'Cadastre-se para gerenciar o inventário de equipamentos.' 
+              ? 'Cadastre-se para tirar dúvidas de hardware e montagem de computadores.' 
               : 'Faça login com suas credenciais para continuar.'}
           </p>
         </div>
