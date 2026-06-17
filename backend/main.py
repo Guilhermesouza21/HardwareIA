@@ -1,4 +1,5 @@
 import os
+import asyncio
 import time
 import logging
 from collections import defaultdict
@@ -138,16 +139,16 @@ async def chat_stream(
 
     enforce_rate_limit(user_id)
 
-    msg_count = get_user_message_count(user_id)
+    msg_count = await asyncio.to_thread(get_user_message_count, user_id)
     if msg_count >= USER_MESSAGE_LIMIT:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Limite de mensagens excedido. Você atingiu o limite máximo de {USER_MESSAGE_LIMIT} mensagens."
         )
 
-    conversation_id = get_or_create_active_conversation(user_id)
-    save_message(user_id, conversation_id, "user", user_message)
-    history_messages = get_messages(user_id, conversation_id)
+    conversation_id = await asyncio.to_thread(get_or_create_active_conversation, user_id)
+    await asyncio.to_thread(save_message, user_id, conversation_id, "user", user_message)
+    history_messages = await asyncio.to_thread(get_messages, user_id, conversation_id)
 
     groq_messages = [
         {
@@ -186,7 +187,7 @@ async def chat_stream(
         finally:
             if accumulated_content.strip():
                 try:
-                    save_message(user_id, conversation_id, "assistant", accumulated_content)
+                    await asyncio.to_thread(save_message, user_id, conversation_id, "assistant", accumulated_content)
                 except Exception as e:
                     logger.error(f"Error saving assistant message: {e}")
 
@@ -195,23 +196,21 @@ async def chat_stream(
 @app.get("/api/history")
 async def chat_history(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
-    conversation_id = get_or_create_active_conversation(user_id)
-    messages = get_messages(user_id, conversation_id)
+    conversation_id = await asyncio.to_thread(get_or_create_active_conversation, user_id)
+    messages = await asyncio.to_thread(get_messages, user_id, conversation_id)
     return {"messages": messages}
 
 @app.get("/api/limit-status")
 async def limit_status(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
-    count = get_user_message_count(user_id)
+    count = await asyncio.to_thread(get_user_message_count, user_id)
     return {
         "count": count,
         "limit": USER_MESSAGE_LIMIT,
         "remaining": max(0, USER_MESSAGE_LIMIT - count)
     }
 
-@app.post("/api/chat/clear")
-async def clear_chat(current_user: dict = Depends(get_current_user)):
-    user_id = current_user["id"]
+def _clear_chat_db(user_id: str) -> str:
     conn = get_connection()
     try:
         with conn.cursor() as cursor:
@@ -221,9 +220,16 @@ async def clear_chat(current_user: dict = Depends(get_current_user)):
             )
             new_id = cursor.fetchone()[0]
             conn.commit()
-            return {"status": "success", "conversation_id": str(new_id)}
+            return str(new_id)
+    finally:
+        release_connection(conn)
+
+@app.post("/api/chat/clear")
+async def clear_chat(current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+    try:
+        new_id = await asyncio.to_thread(_clear_chat_db, user_id)
+        return {"status": "success", "conversation_id": new_id}
     except Exception as e:
         logger.error(f"Error clearing chat for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail="Não foi possível iniciar uma nova conversa.")
-    finally:
-        release_connection(conn)
