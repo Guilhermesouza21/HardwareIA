@@ -7,6 +7,7 @@ from typing import List, Dict
 from contextlib import asynccontextmanager
 
 import httpx
+import json
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -167,6 +168,7 @@ async def chat_stream(
 
     async def event_generator():
         accumulated_content = ""
+        success = True
         try:
             response_stream = await groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -180,12 +182,13 @@ async def chat_stream(
                 text_chunk = chunk.choices[0].delta.content or ""
                 if text_chunk:
                     accumulated_content += text_chunk
-                    yield text_chunk
+                    yield json.dumps({"type": "content", "content": text_chunk}) + "\n"
         except Exception as e:
             logger.error(f"Error streaming from Groq: {e}")
-            yield f"\n[Erro na geração da resposta: {str(e)}]"
+            success = False
+            yield json.dumps({"type": "error", "message": f"Erro na geração da resposta: {str(e)}"}) + "\n"
         finally:
-            if accumulated_content.strip():
+            if success and accumulated_content.strip():
                 try:
                     await asyncio.to_thread(save_message, user_id, conversation_id, "assistant", accumulated_content)
                 except Exception as e:

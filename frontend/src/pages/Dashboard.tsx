@@ -7,6 +7,7 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   created_at?: string;
+  isError?: boolean;
 }
 
 export default function Dashboard() {
@@ -97,9 +98,9 @@ export default function Dashboard() {
     }
   };
 
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const messageText = input.trim();
+  const handleSendMessage = async (e?: React.FormEvent, retryText?: string) => {
+    if (e) e.preventDefault();
+    const messageText = retryText || input.trim();
     if (!messageText || isGenerating) return;
 
     // Enforce message limit client-side before sending
@@ -147,19 +148,45 @@ export default function Dashboard() {
 
       const decoder = new TextDecoder();
       let assistantResponse = '';
+      let buffer = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         const textChunk = decoder.decode(value, { stream: true });
-        assistantResponse += textChunk;
+        buffer += textChunk;
 
-        setMessages(prev => {
-          const updated = [...prev];
-          updated[updated.length - 1] = { role: 'assistant', content: assistantResponse };
-          return updated;
-        });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const data = JSON.parse(line);
+            if (data.type === 'content') {
+              assistantResponse += data.content;
+              setMessages(prev => {
+                const updated = [...prev];
+                updated[updated.length - 1] = { role: 'assistant', content: assistantResponse };
+                return updated;
+              });
+            } else if (data.type === 'error') {
+              setMessages(prev => {
+                const updated = [...prev];
+                updated[updated.length - 1] = { 
+                  role: 'assistant', 
+                  content: data.message || 'Erro ao gerar resposta.', 
+                  isError: true 
+                };
+                return updated;
+              });
+              return;
+            }
+          } catch (err) {
+            console.error('Erro ao processar linha do stream:', err);
+          }
+        }
       }
 
       // Successfully finished, refresh limit counter
@@ -186,12 +213,16 @@ export default function Dashboard() {
         });
       } else {
         console.error('Error during message exchange:', err);
-        setError(err.message || 'Ocorreu um erro desconhecido.');
-        // Clean up empty placeholder assistant bubble
         setMessages(prev => {
           const updated = [...prev];
-          if (updated[updated.length - 1]?.role === 'assistant' && !updated[updated.length - 1].content) {
-            return updated.slice(0, -1);
+          const lastMsg = updated[updated.length - 1];
+          if (lastMsg && lastMsg.role === 'assistant') {
+            updated[updated.length - 1] = {
+              role: 'assistant',
+              content: err.message || 'Falha de comunicação com o servidor.',
+              isError: true
+            };
+            return updated;
           }
           return updated;
         });
@@ -426,6 +457,39 @@ export default function Dashboard() {
                     <div className="message-bubble">
                       {msg.role === 'user' ? (
                         <p>{msg.content}</p>
+                      ) : msg.isError ? (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#f87171' }}>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                              <circle cx="12" cy="12" r="10" />
+                              <line x1="12" y1="8" x2="12" y2="12" />
+                              <line x1="12" y1="16" x2="12.01" y2="16" />
+                            </svg>
+                            <span style={{ fontWeight: 600 }}>Falha na Geração</span>
+                          </div>
+                          <p style={{ margin: 0, fontSize: '13.5px', color: '#fca5a5' }}>{msg.content}</p>
+                          <button 
+                            type="button"
+                            onClick={() => {
+                              const lastUserMsg = [...messages.slice(0, index)].reverse().find(m => m.role === 'user')?.content;
+                              if (lastUserMsg) {
+                                handleSendMessage(undefined, lastUserMsg);
+                              }
+                            }}
+                            className="btn btn-secondary"
+                            style={{ 
+                              marginTop: '8px', 
+                              alignSelf: 'flex-start', 
+                              padding: '4px 10px', 
+                              fontSize: '12px',
+                              borderColor: 'rgba(239, 68, 68, 0.4)',
+                              color: '#f87171',
+                              backgroundColor: 'transparent'
+                            }}
+                          >
+                            Tentar novamente
+                          </button>
+                        </div>
                       ) : (
                         <>
                           <ReactMarkdown>{msg.content}</ReactMarkdown>
