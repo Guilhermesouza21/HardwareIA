@@ -22,7 +22,9 @@ from database import (
     get_messages,
     get_user_message_count,
     get_connection,
-    release_connection
+    release_connection,
+    get_conversations,
+    verify_conversation_owner
 )
 
 load_dotenv()
@@ -119,6 +121,7 @@ def enforce_rate_limit(user_id: str):
 
 class ChatRequest(BaseModel):
     message: str
+    conversation_id: str = None
 
 @app.post("/api/chat")
 async def chat_stream(
@@ -147,7 +150,17 @@ async def chat_stream(
             detail=f"Limite de mensagens excedido. Você atingiu o limite máximo de {USER_MESSAGE_LIMIT} mensagens."
         )
 
-    conversation_id = await asyncio.to_thread(get_or_create_active_conversation, user_id)
+    if payload.conversation_id:
+        status_owner = await asyncio.to_thread(verify_conversation_owner, user_id, payload.conversation_id)
+        if status_owner != "ok":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Acesso negado ou conversa inexistente."
+            )
+        conversation_id = payload.conversation_id
+    else:
+        conversation_id = await asyncio.to_thread(get_or_create_active_conversation, user_id)
+
     await asyncio.to_thread(save_message, user_id, conversation_id, "user", user_message)
     history_messages = await asyncio.to_thread(get_messages, user_id, conversation_id)
 
@@ -170,6 +183,9 @@ async def chat_stream(
         accumulated_content = ""
         success = True
         try:
+            # Yield the active conversation ID first to ensure frontend stays synced
+            yield json.dumps({"type": "conversation_id", "conversation_id": conversation_id}) + "\n"
+            
             response_stream = await groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=groq_messages,
@@ -201,7 +217,38 @@ async def chat_history(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
     conversation_id = await asyncio.to_thread(get_or_create_active_conversation, user_id)
     messages = await asyncio.to_thread(get_messages, user_id, conversation_id)
-    return {"messages": messages}
+    return {"conversation_id": conversation_id, "messages": messages}
+
+@app.get("/api/conversations")
+async def list_conversations(current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+    try:
+        conversations = await asyncio.to_thread(get_conversations, user_id)
+        return {"conversations": conversations}
+    except Exception as e:
+        logger.error(f"Error listing conversations: {e}")
+        raise HTTPException(status_code=500, detail="Não foi possível carregar as conversas.")
+
+@app.get("/api/conversations/{conversation_id}")
+async def get_conversation_details(
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    user_id = current_user["id"]
+    try:
+        status_owner = await asyncio.to_thread(verify_conversation_owner, user_id, conversation_id)
+        if status_owner == "not_found":
+            raise HTTPException(status_code=404, detail="Conversa não encontrada.")
+        elif status_owner == "forbidden":
+            raise HTTPException(status_code=403, detail="Acesso negado a esta conversa.")
+        
+        messages = await asyncio.to_thread(get_messages, user_id, conversation_id)
+        return {"messages": messages}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting conversation details: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao buscar detalhes da conversa.")
 
 @app.get("/api/limit-status")
 async def limit_status(current_user: dict = Depends(get_current_user)):
