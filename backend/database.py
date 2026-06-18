@@ -21,8 +21,8 @@ def init_db():
         return False
         
     try:
-        # Create a connection pool (min 1, max 10 connections)
-        db_pool = pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
+        # Create a connection pool (min 1, max 10 connections) that is thread-safe
+        db_pool = pool.ThreadedConnectionPool(1, 10, dsn=DATABASE_URL)
         logger.info("Database connection pool initialized successfully.")
         
         # Verify connection and create tables if not exists
@@ -145,6 +145,63 @@ def get_user_message_count(user_id):
             return count
     except Exception as e:
         logger.error(f"Error counting messages for user {user_id}: {e}")
+        raise e
+    finally:
+        release_connection(conn)
+
+def get_conversations(user_id):
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT c.id, c.title, c.created_at, 
+                       COALESCE(MAX(m.created_at), c.created_at) AS updated_at,
+                       (SELECT content FROM messages WHERE conversation_id = c.id AND role = 'user' ORDER BY created_at ASC LIMIT 1) as first_msg
+                FROM conversations c
+                LEFT JOIN messages m ON c.id = m.conversation_id
+                WHERE c.user_id = %s
+                GROUP BY c.id, c.title, c.created_at
+                ORDER BY updated_at DESC
+            """, (user_id,))
+            rows = cursor.fetchall()
+            conversations = []
+            for r in rows:
+                title = r[1]
+                first_msg = r[4]
+                if first_msg:
+                    truncated = first_msg.strip()
+                    if len(truncated) > 40:
+                        truncated = truncated[:37] + "..."
+                    title = truncated
+                conversations.append({
+                    "id": str(r[0]),
+                    "title": title,
+                    "created_at": r[2].isoformat(),
+                    "updated_at": r[3].isoformat()
+                })
+            return conversations
+    except Exception as e:
+        logger.error(f"Error fetching conversations for user {user_id}: {e}")
+        raise e
+    finally:
+        release_connection(conn)
+
+def verify_conversation_owner(user_id, conversation_id):
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT user_id FROM conversations WHERE id = %s",
+                (conversation_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return "not_found"
+            if str(row[0]) != str(user_id):
+                return "forbidden"
+            return "ok"
+    except Exception as e:
+        logger.error(f"Error checking conversation owner: {e}")
         raise e
     finally:
         release_connection(conn)

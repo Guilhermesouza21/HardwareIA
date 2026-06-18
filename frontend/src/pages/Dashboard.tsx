@@ -7,6 +7,7 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   created_at?: string;
+  isError?: boolean;
 }
 
 export default function Dashboard() {
@@ -20,6 +21,11 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [copySuccessId, setCopySuccessId] = useState<string | null>(null);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
+  const [isLoadingChat, setIsLoadingChat] = useState(false);
+  
+  // Conversations (History) state
+  const [conversations, setConversations] = useState<{ id: string; title: string; created_at: string; updated_at: string }[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -31,6 +37,26 @@ export default function Dashboard() {
     } catch (err) {
       console.error('Erro ao buscar token de sessão:', err);
       return null;
+    }
+  };
+
+  // Fetch the list of conversations
+  const fetchConversations = async () => {
+    try {
+      const token = await getSessionToken();
+      if (!token) return;
+
+      const res = await fetch('/api/conversations', {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setConversations(data.conversations || []);
+      }
+    } catch (err) {
+      console.error('Erro ao buscar conversas:', err);
     }
   };
 
@@ -62,6 +88,9 @@ export default function Dashboard() {
         if (historyRes.ok) {
           const data = await historyRes.json();
           setMessages(data.messages || []);
+          if (data.conversation_id) {
+            setActiveConversationId(data.conversation_id);
+          }
         }
 
         // 2. Fetch limit status
@@ -74,6 +103,17 @@ export default function Dashboard() {
           const data = await limitRes.json();
           setMessageLimit({ count: data.count, limit: data.limit });
         }
+
+        // 3. Fetch conversations list
+        const convRes = await fetch('/api/conversations', {
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        });
+        if (convRes.ok) {
+          const data = await convRes.json();
+          setConversations(data.conversations || []);
+        }
       } catch (err) {
         console.error('Erro ao carregar dados iniciais:', err);
         setError('Não foi possível carregar as informações do assistente.');
@@ -82,6 +122,40 @@ export default function Dashboard() {
 
     loadInitialData();
   }, []);
+
+  const handleSelectConversation = async (convId: string) => {
+    if (isGenerating) return; // Prevent switching while generating
+    setIsLoadingChat(true);   // Mostrar loading central imediato
+    setMessages([]);          // Esconder mensagens antigas imediatamente (evitar flash)
+    setError(null);
+    setActiveConversationId(convId);
+    
+    try {
+      const token = await getSessionToken();
+      if (!token) {
+        setIsLoadingChat(false);
+        return;
+      }
+
+      const res = await fetch(`/api/conversations/${convId}`, {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setMessages(data.messages || []);
+      } else {
+        const errorData = await res.json().catch(() => ({ detail: 'Erro ao carregar conversa' }));
+        setError(errorData.detail || 'Não foi possível carregar as mensagens da conversa.');
+      }
+    } catch (err) {
+      console.error('Erro ao carregar conversa:', err);
+      setError('Erro de rede ao carregar a conversa.');
+    } finally {
+      setIsLoadingChat(false); // Liberar carregamento
+    }
+  };
 
   const handleLogout = async () => {
     try {
@@ -97,9 +171,9 @@ export default function Dashboard() {
     }
   };
 
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const messageText = input.trim();
+  const handleSendMessage = async (e?: React.FormEvent, retryText?: string) => {
+    if (e) e.preventDefault();
+    const messageText = retryText || input.trim();
     if (!messageText || isGenerating) return;
 
     // Enforce message limit client-side before sending
@@ -128,7 +202,7 @@ export default function Dashboard() {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify({ message: messageText }),
+        body: JSON.stringify({ message: messageText, conversation_id: activeConversationId }),
         signal: controller.signal
       });
 
@@ -147,19 +221,52 @@ export default function Dashboard() {
 
       const decoder = new TextDecoder();
       let assistantResponse = '';
+      let buffer = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         const textChunk = decoder.decode(value, { stream: true });
-        assistantResponse += textChunk;
+        buffer += textChunk;
 
-        setMessages(prev => {
-          const updated = [...prev];
-          updated[updated.length - 1] = { role: 'assistant', content: assistantResponse };
-          return updated;
-        });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const data = JSON.parse(line);
+            if (data.type === 'conversation_id') {
+              setActiveConversationId(data.conversation_id);
+            } else if (data.type === 'content') {
+              assistantResponse += data.content;
+
+// atualiza sem travar UI
+setMessages(prev => {
+  const updated = [...prev];
+  updated[updated.length - 1] = {
+    role: 'assistant',
+    content: assistantResponse
+  };
+  return updated;
+});
+            } else if (data.type === 'error') {
+              setMessages(prev => {
+                const updated = [...prev];
+                updated[updated.length - 1] = { 
+                  role: 'assistant', 
+                  content: data.message || 'Erro ao gerar resposta.', 
+                  isError: true 
+                };
+                return updated;
+              });
+              return;
+            }
+          } catch (err) {
+            console.error('Erro ao processar linha do stream:', err);
+          }
+        }
       }
 
       // Successfully finished, refresh limit counter
@@ -172,6 +279,8 @@ export default function Dashboard() {
         const data = await limitRes.json();
         setMessageLimit({ count: data.count, limit: data.limit });
       }
+
+      await fetchConversations();
 
     } catch (err: any) {
       if (err.name === 'AbortError') {
@@ -186,12 +295,16 @@ export default function Dashboard() {
         });
       } else {
         console.error('Error during message exchange:', err);
-        setError(err.message || 'Ocorreu um erro desconhecido.');
-        // Clean up empty placeholder assistant bubble
         setMessages(prev => {
           const updated = [...prev];
-          if (updated[updated.length - 1]?.role === 'assistant' && !updated[updated.length - 1].content) {
-            return updated.slice(0, -1);
+          const lastMsg = updated[updated.length - 1];
+          if (lastMsg && lastMsg.role === 'assistant') {
+            updated[updated.length - 1] = {
+              role: 'assistant',
+              content: err.message || 'Falha de comunicação com o servidor.',
+              isError: true
+            };
+            return updated;
           }
           return updated;
         });
@@ -212,10 +325,16 @@ export default function Dashboard() {
     if (!window.confirm('Tem certeza que deseja iniciar uma nova conversa? Seu histórico anterior desta tela será arquivado.')) {
       return;
     }
+    setIsLoadingChat(true); // Exibir loading imediato no chat
+    setMessages([]);       // Bloquear exibição de conteúdo antigo
+    setError(null);
 
     try {
       const token = await getSessionToken();
-      if (!token) return;
+      if (!token) {
+        setIsLoadingChat(false);
+        return;
+      }
 
       const response = await fetch('/api/chat/clear', {
         method: 'POST',
@@ -225,14 +344,19 @@ export default function Dashboard() {
       });
 
       if (response.ok) {
-        setMessages([]);
-        setError(null);
+        const data = await response.json();
+        if (data.conversation_id) {
+          setActiveConversationId(data.conversation_id);
+        }
+        await fetchConversations();
       } else {
         setError('Não foi possível reiniciar a conversa.');
       }
     } catch (err) {
       console.error('Erro ao reiniciar conversa:', err);
       setError('Erro de rede ao limpar chat.');
+    } finally {
+      setIsLoadingChat(false); // Libera o input e o chat após a conversa estar criada
     }
   };
 
@@ -359,6 +483,39 @@ export default function Dashboard() {
               </div>
             )}
             
+            {/* Histórico de Chats */}
+            <div className="history-card glass-panel" style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: '220px', maxHeight: '380px' }}>
+              <div className="history-card-header" style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '12px 16px', borderBottom: '1px solid var(--border-glass)', fontWeight: 600, fontSize: '14px', color: 'var(--text-primary)' }}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 8v4l3 3" />
+                  <circle cx="12" cy="12" r="10" />
+                </svg>
+                <span>Histórico de Chats</span>
+              </div>
+              <div className="history-list" style={{ overflowY: 'auto', flex: 1, padding: '8px' }}>
+                {conversations.length === 0 ? (
+                  <div style={{ padding: '16px', textAlign: 'center', fontSize: '13px', color: 'var(--text-muted)' }}>
+                    Nenhuma conversa anterior.
+                  </div>
+                ) : (
+                  conversations.map((conv) => (
+                    <button
+                      key={conv.id}
+                      onClick={() => handleSelectConversation(conv.id)}
+                      className={`history-item ${activeConversationId === conv.id ? 'active' : ''}`}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, opacity: 0.7 }}>
+                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                      </svg>
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                        {conv.title}
+                      </span>
+                    </button>
+                  ))
+                )}
+              </div>
+            </div>
+
             {/* Reset Chat Button */}
             <button 
               onClick={handleClearChat} 
@@ -389,14 +546,19 @@ export default function Dashboard() {
               </div>
               <div style={{ display: 'flex', alignItems: 'center' }}>
                 <span className="badge" style={{ background: 'var(--primary-glow)', color: 'var(--primary)', border: '1px solid rgba(6, 182, 212, 0.2)' }}>
-                  Online (GPT-4o)
+                  Online (Llama 3.3)
                 </span>
               </div>
             </div>
 
             {/* Messages Area */}
             <div className="messages-list">
-              {messages.length === 0 ? (
+              {isLoadingChat ? (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-secondary)' }}>
+                  <div className="spinner" style={{ width: '40px', height: '40px' }}></div>
+                  <span style={{ marginTop: '16px', fontSize: '14px', color: 'var(--text-secondary)' }}>Carregando conversa...</span>
+                </div>
+              ) : messages.length === 0 ? (
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-secondary)', textAlign: 'center', padding: '0 40px' }}>
                   <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ color: 'var(--text-muted)', marginBottom: '16px' }}>
                     <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
@@ -426,6 +588,39 @@ export default function Dashboard() {
                     <div className="message-bubble">
                       {msg.role === 'user' ? (
                         <p>{msg.content}</p>
+                      ) : msg.isError ? (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#f87171' }}>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                              <circle cx="12" cy="12" r="10" />
+                              <line x1="12" y1="8" x2="12" y2="12" />
+                              <line x1="12" y1="16" x2="12.01" y2="16" />
+                            </svg>
+                            <span style={{ fontWeight: 600 }}>Falha na Geração</span>
+                          </div>
+                          <p style={{ margin: 0, fontSize: '13.5px', color: '#fca5a5' }}>{msg.content}</p>
+                          <button 
+                            type="button"
+                            onClick={() => {
+                              const lastUserMsg = [...messages.slice(0, index)].reverse().find(m => m.role === 'user')?.content;
+                              if (lastUserMsg) {
+                                handleSendMessage(undefined, lastUserMsg);
+                              }
+                            }}
+                            className="btn btn-secondary"
+                            style={{ 
+                              marginTop: '8px', 
+                              alignSelf: 'flex-start', 
+                              padding: '4px 10px', 
+                              fontSize: '12px',
+                              borderColor: 'rgba(239, 68, 68, 0.4)',
+                              color: '#f87171',
+                              backgroundColor: 'transparent'
+                            }}
+                          >
+                            Tentar novamente
+                          </button>
+                        </div>
                       ) : (
                         <>
                           <ReactMarkdown>{msg.content}</ReactMarkdown>
@@ -499,9 +694,11 @@ export default function Dashboard() {
                   type="text"
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
-                  disabled={isGenerating || (messageLimit !== null && messageLimit.count >= messageLimit.limit)}
+                  disabled={isGenerating || isLoadingChat || (messageLimit !== null && messageLimit.count >= messageLimit.limit)}
                   placeholder={
-                    messageLimit !== null && messageLimit.count >= messageLimit.limit
+                    isLoadingChat
+                      ? "Aguarde a conversa carregar..."
+                      : messageLimit !== null && messageLimit.count >= messageLimit.limit
                       ? "Limite de mensagens atingido."
                       : "Digite sua dúvida sobre hardware..."
                   }
@@ -523,7 +720,7 @@ export default function Dashboard() {
                 ) : (
                   <button 
                     type="submit" 
-                    disabled={!input.trim() || (messageLimit !== null && messageLimit.count >= messageLimit.limit)}
+                    disabled={!input.trim() || isLoadingChat || (messageLimit !== null && messageLimit.count >= messageLimit.limit)}
                     className="btn" 
                     style={{ padding: '12px 18px' }}
                   >

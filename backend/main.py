@@ -1,4 +1,5 @@
 import os
+import asyncio
 import time
 import logging
 from collections import defaultdict
@@ -6,6 +7,7 @@ from typing import List, Dict
 from contextlib import asynccontextmanager
 
 import httpx
+import json
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -20,7 +22,9 @@ from database import (
     get_messages,
     get_user_message_count,
     get_connection,
-    release_connection
+    release_connection,
+    get_conversations,
+    verify_conversation_owner
 )
 
 load_dotenv()
@@ -117,6 +121,7 @@ def enforce_rate_limit(user_id: str):
 
 class ChatRequest(BaseModel):
     message: str
+    conversation_id: str = None
 
 @app.post("/api/chat")
 async def chat_stream(
@@ -138,16 +143,26 @@ async def chat_stream(
 
     enforce_rate_limit(user_id)
 
-    msg_count = get_user_message_count(user_id)
+    msg_count = await asyncio.to_thread(get_user_message_count, user_id)
     if msg_count >= USER_MESSAGE_LIMIT:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Limite de mensagens excedido. Você atingiu o limite máximo de {USER_MESSAGE_LIMIT} mensagens."
         )
 
-    conversation_id = get_or_create_active_conversation(user_id)
-    save_message(user_id, conversation_id, "user", user_message)
-    history_messages = get_messages(user_id, conversation_id)
+    if payload.conversation_id:
+        status_owner = await asyncio.to_thread(verify_conversation_owner, user_id, payload.conversation_id)
+        if status_owner != "ok":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Acesso negado ou conversa inexistente."
+            )
+        conversation_id = payload.conversation_id
+    else:
+        conversation_id = await asyncio.to_thread(get_or_create_active_conversation, user_id)
+
+    await asyncio.to_thread(save_message, user_id, conversation_id, "user", user_message)
+    history_messages = await asyncio.to_thread(get_messages, user_id, conversation_id)
 
     groq_messages = [
         {
@@ -166,7 +181,11 @@ async def chat_stream(
 
     async def event_generator():
         accumulated_content = ""
+        success = True
         try:
+            # Yield the active conversation ID first to ensure frontend stays synced
+            yield json.dumps({"type": "conversation_id", "conversation_id": conversation_id}) + "\n"
+            
             response_stream = await groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=groq_messages,
@@ -179,14 +198,15 @@ async def chat_stream(
                 text_chunk = chunk.choices[0].delta.content or ""
                 if text_chunk:
                     accumulated_content += text_chunk
-                    yield text_chunk
+                    yield json.dumps({"type": "content", "content": text_chunk}) + "\n"
         except Exception as e:
             logger.error(f"Error streaming from Groq: {e}")
-            yield f"\n[Erro na geração da resposta: {str(e)}]"
+            success = False
+            yield json.dumps({"type": "error", "message": f"Erro na geração da resposta: {str(e)}"}) + "\n"
         finally:
-            if accumulated_content.strip():
+            if success and accumulated_content.strip():
                 try:
-                    save_message(user_id, conversation_id, "assistant", accumulated_content)
+                    await asyncio.to_thread(save_message, user_id, conversation_id, "assistant", accumulated_content)
                 except Exception as e:
                     logger.error(f"Error saving assistant message: {e}")
 
@@ -195,23 +215,52 @@ async def chat_stream(
 @app.get("/api/history")
 async def chat_history(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
-    conversation_id = get_or_create_active_conversation(user_id)
-    messages = get_messages(user_id, conversation_id)
-    return {"messages": messages}
+    conversation_id = await asyncio.to_thread(get_or_create_active_conversation, user_id)
+    messages = await asyncio.to_thread(get_messages, user_id, conversation_id)
+    return {"conversation_id": conversation_id, "messages": messages}
+
+@app.get("/api/conversations")
+async def list_conversations(current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+    try:
+        conversations = await asyncio.to_thread(get_conversations, user_id)
+        return {"conversations": conversations}
+    except Exception as e:
+        logger.error(f"Error listing conversations: {e}")
+        raise HTTPException(status_code=500, detail="Não foi possível carregar as conversas.")
+
+@app.get("/api/conversations/{conversation_id}")
+async def get_conversation_details(
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    user_id = current_user["id"]
+    try:
+        status_owner = await asyncio.to_thread(verify_conversation_owner, user_id, conversation_id)
+        if status_owner == "not_found":
+            raise HTTPException(status_code=404, detail="Conversa não encontrada.")
+        elif status_owner == "forbidden":
+            raise HTTPException(status_code=403, detail="Acesso negado a esta conversa.")
+        
+        messages = await asyncio.to_thread(get_messages, user_id, conversation_id)
+        return {"messages": messages}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting conversation details: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao buscar detalhes da conversa.")
 
 @app.get("/api/limit-status")
 async def limit_status(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
-    count = get_user_message_count(user_id)
+    count = await asyncio.to_thread(get_user_message_count, user_id)
     return {
         "count": count,
         "limit": USER_MESSAGE_LIMIT,
         "remaining": max(0, USER_MESSAGE_LIMIT - count)
     }
 
-@app.post("/api/chat/clear")
-async def clear_chat(current_user: dict = Depends(get_current_user)):
-    user_id = current_user["id"]
+def _clear_chat_db(user_id: str) -> str:
     conn = get_connection()
     try:
         with conn.cursor() as cursor:
@@ -221,9 +270,16 @@ async def clear_chat(current_user: dict = Depends(get_current_user)):
             )
             new_id = cursor.fetchone()[0]
             conn.commit()
-            return {"status": "success", "conversation_id": str(new_id)}
+            return str(new_id)
+    finally:
+        release_connection(conn)
+
+@app.post("/api/chat/clear")
+async def clear_chat(current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+    try:
+        new_id = await asyncio.to_thread(_clear_chat_db, user_id)
+        return {"status": "success", "conversation_id": new_id}
     except Exception as e:
         logger.error(f"Error clearing chat for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail="Não foi possível iniciar uma nova conversa.")
-    finally:
-        release_connection(conn)
