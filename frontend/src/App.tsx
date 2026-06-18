@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider } from './context/AuthContext';
 import { ProtectedRoute } from './components/ProtectedRoute';
+import { PublicRoute } from './components/PublicRoute';
 import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import VerifyEmail from './pages/VerifyEmail';
@@ -10,7 +11,7 @@ function App() {
     <AuthProvider>
       <BrowserRouter>
         <Routes>
-          <Route path="/login" element={<Login />} />
+          <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
           <Route path="/verify-email" element={<VerifyEmail />} />
           <Route 
             path="/" 

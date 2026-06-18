@@ -1,7 +1,9 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { supabase } from '../supabaseClient';
 import ReactMarkdown from 'react-markdown';
+import type { Components } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -20,6 +22,7 @@ export default function Dashboard() {
   const [messageLimit, setMessageLimit] = useState<{ count: number; limit: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copySuccessId, setCopySuccessId] = useState<string | null>(null);
+  const [codeCopyId, setCodeCopyId] = useState<string | null>(null);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
   const [isLoadingChat, setIsLoadingChat] = useState(false);
   
@@ -28,6 +31,7 @@ export default function Dashboard() {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Helper to fetch current session access token
   const getSessionToken = async () => {
@@ -71,6 +75,69 @@ export default function Dashboard() {
   useEffect(() => {
     scrollToBottom();
   }, [messages, isGenerating]);
+
+  // Auto-resize textarea
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+      textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, 200) + 'px';
+    }
+  }, [input]);
+
+  // Copy code block handler
+  const handleCopyCode = useCallback((code: string, id: string) => {
+    navigator.clipboard.writeText(code);
+    setCodeCopyId(id);
+    setTimeout(() => setCodeCopyId(null), 2000);
+  }, []);
+
+  // ReactMarkdown custom components for tables and code blocks
+  const mdComponents: Components = {
+    table: ({ children }) => (
+      <div className="md-table-wrapper">
+        <table className="md-table">{children}</table>
+      </div>
+    ),
+    thead: ({ children }) => <thead className="md-thead">{children}</thead>,
+    tbody: ({ children }) => <tbody>{children}</tbody>,
+    tr: ({ children }) => <tr className="md-tr">{children}</tr>,
+    th: ({ children }) => <th className="md-th">{children}</th>,
+    td: ({ children }) => <td className="md-td">{children}</td>,
+    code: ({ className, children, ...rest }) => {
+      const isInline = !className;
+      if (isInline) {
+        return <code className="md-code-inline" {...rest}>{children}</code>;
+      }
+      const lang = className?.replace('language-', '') || 'código';
+      const codeStr = String(children).replace(/\n$/, '');
+      const codeId = `code-${lang}-${codeStr.slice(0, 20)}`;
+      return (
+        <div className="md-code-block">
+          <div className="md-code-header">
+            <span className="md-code-lang">{lang.toUpperCase()}</span>
+            <button
+              className="md-code-copy-btn"
+              onClick={() => handleCopyCode(codeStr, codeId)}
+              title="Copiar código"
+            >
+              {codeCopyId === codeId ? (
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              ) : (
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                </svg>
+              )}
+              {codeCopyId === codeId ? 'Copiado!' : 'Copiar'}
+            </button>
+          </div>
+          <pre className="md-code-pre"><code>{codeStr}</code></pre>
+        </div>
+      );
+    },
+  };
 
   // Load chat history and limit status on mount
   useEffect(() => {
@@ -186,6 +253,10 @@ export default function Dashboard() {
     setError(null);
     setMessages(prev => [...prev, { role: 'user', content: messageText }]);
     setIsGenerating(true);
+    // Reset textarea height
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+    }
 
     const controller = new AbortController();
     setAbortController(controller);
@@ -367,6 +438,15 @@ setMessages(prev => {
     setTimeout(() => {
       setCopySuccessId(null);
     }, 2000);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      if (!isGenerating && !isLoadingChat && input.trim()) {
+        handleSendMessage();
+      }
+    }
   };
 
   const limitPercentage = messageLimit 
@@ -623,7 +703,10 @@ setMessages(prev => {
                         </div>
                       ) : (
                         <>
-                          <ReactMarkdown>{msg.content}</ReactMarkdown>
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm]}
+                            components={mdComponents}
+                          >{msg.content}</ReactMarkdown>
                           {msg.content.length > 0 && (
                             <div className="message-actions">
                               <button 
@@ -689,48 +772,65 @@ setMessages(prev => {
 
             {/* Input area */}
             <div className="chat-input-panel">
-              <form onSubmit={handleSendMessage} className="chat-input-form">
-                <input
-                  type="text"
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  disabled={isGenerating || isLoadingChat || (messageLimit !== null && messageLimit.count >= messageLimit.limit)}
-                  placeholder={
-                    isLoadingChat
-                      ? "Aguarde a conversa carregar..."
-                      : messageLimit !== null && messageLimit.count >= messageLimit.limit
-                      ? "Limite de mensagens atingido."
-                      : "Digite sua dúvida sobre hardware..."
-                  }
-                  className="chat-input-field"
-                />
-                
-                {isGenerating ? (
-                  <button 
-                    type="button" 
-                    onClick={handleStopGeneration} 
-                    className="btn btn-secondary" 
-                    style={{ padding: '12px 18px', display: 'flex', gap: '6px', borderColor: 'var(--danger-glow)', color: '#fca5a5' }}
+              <div className="chat-input-wrapper">
+                <div className="chat-input-container">
+                  {/* Future attachments placeholder */}
+                  <button
+                    type="button"
+                    className="chat-attach-btn"
+                    title="Em breve: anexar arquivo"
+                    disabled
                   >
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <rect x="4" y="4" width="16" height="16" rx="2" />
-                    </svg>
-                    Parar
-                  </button>
-                ) : (
-                  <button 
-                    type="submit" 
-                    disabled={!input.trim() || isLoadingChat || (messageLimit !== null && messageLimit.count >= messageLimit.limit)}
-                    className="btn" 
-                    style={{ padding: '12px 18px' }}
-                  >
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <line x1="22" y1="2" x2="11" y2="13" />
-                      <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
                     </svg>
                   </button>
-                )}
-              </form>
+
+                  <textarea
+                    ref={textareaRef}
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                    onKeyDown={handleKeyDown}
+                    disabled={isGenerating || isLoadingChat || (messageLimit !== null && messageLimit.count >= messageLimit.limit)}
+                    placeholder={
+                      isLoadingChat
+                        ? "Aguarde a conversa carregar..."
+                        : messageLimit !== null && messageLimit.count >= messageLimit.limit
+                        ? "Limite de mensagens atingido."
+                        : "Digite sua dúvida sobre hardware..."
+                    }
+                    className="chat-input-textarea"
+                    rows={1}
+                  />
+
+                  {isGenerating ? (
+                    <button
+                      type="button"
+                      onClick={handleStopGeneration}
+                      className="chat-send-btn chat-stop-btn"
+                      title="Parar geração"
+                    >
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <rect x="4" y="4" width="16" height="16" rx="2" />
+                      </svg>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => handleSendMessage()}
+                      disabled={!input.trim() || isLoadingChat || (messageLimit !== null && messageLimit.count >= messageLimit.limit)}
+                      className="chat-send-btn"
+                      title="Enviar mensagem (Enter)"
+                    >
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <line x1="12" y1="19" x2="12" y2="5" />
+                        <polyline points="5 12 12 5 19 12" />
+                      </svg>
+                    </button>
+                  )}
+                </div>
+                <p className="chat-input-hint">Enter envia &middot; Shift+Enter nova linha</p>
+              </div>
             </div>
 
           </section>
