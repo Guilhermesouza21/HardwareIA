@@ -1,0 +1,52 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+
+    container_name: hardwareia-backend
+
+    restart: unless-stopped
+
+    env_file:
+      - ./backend/.env
+
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - USER_MESSAGE_LIMIT=${USER_MESSAGE_LIMIT:-50}
+
+    expose:
+      - "8000"
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/docs')"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+
+    container_name: hardwareia-frontend
+
+    restart: unless-stopped
+
+    ports:
+      - "80:80"
+
+    depends_on:
+      backend:
+        condition: service_healthy
